@@ -2,7 +2,7 @@
 set -o pipefail
 
 # set -x (bash debug) if log level is trace
-# https://github.com/osixia/docker-light-baseimage/blob/stable/image/tool/log-helper
+# https://github.com/osixia/docker-light-baseimage/blob/master/image/tool/log-helper
 log-helper level eq trace && set -x
 
 # Reduce maximum number of number of open file descriptors to 1024
@@ -12,25 +12,25 @@ ulimit -n $LDAP_NOFILE
 
 
 # usage: file_env VAR
-#    ie: file_env 'XYZ_DB_PASSWORD' 
+#    ie: file_env 'XYZ_DB_PASSWORD'
 # (will allow for "$XYZ_DB_PASSWORD_FILE" to fill in the value of
 #  "$XYZ_DB_PASSWORD" from a file, especially for Docker's secrets feature)
 file_env() {
-	local var="$1"
-	local fileVar="${var}_FILE"
+        local var="$1"
+        local fileVar="${var}_FILE"
 
   # The variables are already defined from the docker-light-baseimage
   # So if the _FILE variable is available we ovewrite them
-	if [ "${!fileVar:-}" ]; then
+        if [ "${!fileVar:-}" ]; then
     log-helper trace "${fileVar} was defined"
 
-		val="$(< "${!fileVar}")"
+                val="$(< "${!fileVar}")"
     log-helper debug "${var} was repalced with the contents of ${fileVar} (the value was: ${val})"
 
     export "$var"="$val"
-	fi
-	
-	unset "$fileVar"
+        fi
+
+        unset "$fileVar"
 }
 
 
@@ -42,8 +42,38 @@ file_env 'LDAP_READONLY_USER_PASSWORD'
 [ -d /var/lib/ldap ] || mkdir -p /var/lib/ldap
 [ -d /etc/ldap/slapd.d ] || mkdir -p /etc/ldap/slapd.d
 
+log-helper info "openldap user and group adjustments"
+LDAP_OPENLDAP_UID=${LDAP_OPENLDAP_UID:-911}
+LDAP_OPENLDAP_GID=${LDAP_OPENLDAP_GID:-911}
+
+log-helper info "get current openldap uid/gid info inside container"
+CUR_USER_GID=`id -g openldap || true`
+CUR_USER_UID=`id -u openldap || true`
+
+LDAP_UIDGID_CHANGED=false
+if [ "$LDAP_OPENLDAP_UID" != "$CUR_USER_UID" ]; then
+    log-helper info "CUR_USER_UID (${CUR_USER_UID}) does't match LDAP_OPENLDAP_UID (${LDAP_OPENLDAP_UID}), adjusting..."
+    usermod -o -u "$LDAP_OPENLDAP_UID" openldap
+    LDAP_UIDGID_CHANGED=true
+fi
+if [ "$LDAP_OPENLDAP_GID" != "$CUR_USER_GID" ]; then
+    log-helper info "CUR_USER_GID (${CUR_USER_GID}) does't match LDAP_OPENLDAP_GID (${LDAP_OPENLDAP_GID}), adjusting..."
+    groupmod -o -g "$LDAP_OPENLDAP_GID" openldap
+    LDAP_UIDGID_CHANGED=true
+fi
+
+log-helper info '-------------------------------------'
+log-helper info 'openldap GID/UID'
+log-helper info '-------------------------------------'
+log-helper info "User uid:    $(id -u openldap)"
+log-helper info "User gid:    $(id -g openldap)"
+log-helper info "uid/gid changed: ${LDAP_UIDGID_CHANGED}"
+log-helper info "-------------------------------------"
+
 # fix file permissions
 if [ "${DISABLE_CHOWN,,}" == "false" ]; then
+  log-helper info "updating file uid/gid ownership"
+  chown -R openldap:openldap /var/run/slapd
   chown -R openldap:openldap /var/lib/ldap
   chown -R openldap:openldap /etc/ldap
   chown -R openldap:openldap ${CONTAINER_SERVICE_DIR}/slapd
@@ -60,6 +90,28 @@ LDAP_TLS_CRT_PATH="${CONTAINER_SERVICE_DIR}/slapd/assets/certs/$LDAP_TLS_CRT_FIL
 LDAP_TLS_KEY_PATH="${CONTAINER_SERVICE_DIR}/slapd/assets/certs/$LDAP_TLS_KEY_FILENAME"
 LDAP_TLS_DH_PARAM_PATH="${CONTAINER_SERVICE_DIR}/slapd/assets/certs/$LDAP_TLS_DH_PARAM_FILENAME"
 
+copy_internal_seed_if_exists() {
+  local src=$1
+  local dest=$2
+  if [ ! -z "${src}" ]; then
+    echo  -e "Copy from internal path ${src} to ${dest}"
+    cp -R ${src} ${dest}
+  fi
+}
+
+# Copy seed files from internal path if specified
+file_env 'LDAP_SEED_INTERNAL_LDAP_TLS_CRT_FILE'
+copy_internal_seed_if_exists "${LDAP_SEED_INTERNAL_LDAP_TLS_CRT_FILE}" "${LDAP_TLS_CRT_PATH}"
+file_env 'LDAP_SEED_INTERNAL_LDAP_TLS_KEY_FILE'
+copy_internal_seed_if_exists "${LDAP_SEED_INTERNAL_LDAP_TLS_KEY_FILE}" "${LDAP_TLS_KEY_PATH}"
+file_env 'LDAP_SEED_INTERNAL_LDAP_TLS_CA_CRT_FILE'
+copy_internal_seed_if_exists "${LDAP_SEED_INTERNAL_LDAP_TLS_CA_CRT_FILE}" "${LDAP_TLS_CA_CRT_PATH}"
+file_env 'LDAP_SEED_INTERNAL_LDAP_TLS_DH_PARAM_FILE'
+copy_internal_seed_if_exists "${LDAP_SEED_INTERNAL_LDAP_TLS_DH_PARAM_FILE}" "${LDAP_TLS_DH_PARAM_PATH}"
+file_env 'LDAP_SEED_INTERNAL_SCHEMA_PATH'
+copy_internal_seed_if_exists "${LDAP_SEED_INTERNAL_SCHEMA_PATH}" "${CONTAINER_SERVICE_DIR}/slapd/assets/config/bootstrap/schema/custom"
+file_env 'LDAP_SEED_INTERNAL_LDIF_PATH'
+copy_internal_seed_if_exists "${LDAP_SEED_INTERNAL_LDIF_PATH}" "${CONTAINER_SERVICE_DIR}/slapd/assets/config/bootstrap/ldif/custom"
 
 # CONTAINER_SERVICE_DIR and CONTAINER_STATE_DIR variables are set by
 # the baseimage run tool more info : https://github.com/osixia/docker-light-baseimage
@@ -83,13 +135,12 @@ if [ ! -e "$FIRST_START_DONE" ]; then
     fi
     # Check that LDAP_BASE_DN and LDAP_DOMAIN are in sync
     domain_from_base_dn=$(echo $LDAP_BASE_DN | tr ',' '\n' | sed -e 's/^.*=//' | tr '\n' '.' | sed -e 's/\.$//')
-    set +e
-    echo "$domain_from_base_dn" | egrep -q ".*$LDAP_DOMAIN\$"
-    if [ $? -ne 0 ]; then
+    if `echo "$domain_from_base_dn" | egrep -q ".*$LDAP_DOMAIN\$" || echo $LDAP_DOMAIN | egrep -q ".*$domain_from_base_dn\$"`; then
+      : # pass
+    else
       log-helper error "Error: domain $domain_from_base_dn derived from LDAP_BASE_DN $LDAP_BASE_DN does not match LDAP_DOMAIN $LDAP_DOMAIN"
       exit 1
     fi
-    set -e
   }
 
   function is_new_schema() {
@@ -254,11 +305,11 @@ EOF
 
     # start OpenLDAP
     log-helper info "Start OpenLDAP..."
-
+    # At this stage, we can just listen to ldap:// and ldap:// without naming any names
     if log-helper level ge debug; then
-      slapd -h "ldap://$HOSTNAME $PREVIOUS_HOSTNAME_PARAM ldap://localhost ldapi:///" -u openldap -g openldap -d $LDAP_LOG_LEVEL 2>&1 &
+      slapd -h "ldap:/// ldapi:///" -u openldap -g openldap -d "$LDAP_LOG_LEVEL" 2>&1 &
     else
-      slapd -h "ldap://$HOSTNAME $PREVIOUS_HOSTNAME_PARAM ldap://localhost ldapi:///" -u openldap -g openldap
+      slapd -h "ldap:/// ldapi:///" -u openldap -g openldap
     fi
 
 
@@ -347,12 +398,12 @@ EOF
       log-helper info "Add TLS config..."
 
       # generate a certificate and key with ssl-helper tool if LDAP_CRT and LDAP_KEY files don't exists
-      # https://github.com/osixia/docker-light-baseimage/blob/stable/image/service-available/:ssl-tools/assets/tool/ssl-helper
+      # https://github.com/osixia/docker-light-baseimage/blob/master/image/service-available/:ssl-tools/assets/tool/ssl-helper
       ssl-helper $LDAP_SSL_HELPER_PREFIX $LDAP_TLS_CRT_PATH $LDAP_TLS_KEY_PATH $LDAP_TLS_CA_CRT_PATH
 
       # create DHParamFile if not found
       [ -f ${LDAP_TLS_DH_PARAM_PATH} ] || openssl dhparam -out ${LDAP_TLS_DH_PARAM_PATH} 2048
-      
+
       # fix file permissions
       if [ "${DISABLE_CHOWN,,}" == "false" ]; then
         chmod 600 ${LDAP_TLS_DH_PARAM_PATH}
@@ -439,6 +490,13 @@ EOF
       [[ -f "$WAS_STARTED_WITH_REPLICATION" ]] && rm -f "$WAS_STARTED_WITH_REPLICATION"
       echo "export PREVIOUS_HOSTNAME=${HOSTNAME}" > $WAS_STARTED_WITH_REPLICATION
 
+    elif [ "${LDAP_REPLICATION,,}" == "own" ]; then
+
+      log-helper info "Not touching replication config..."
+
+      [[ -f "$WAS_STARTED_WITH_REPLICATION" ]] && rm -f "$WAS_STARTED_WITH_REPLICATION"
+      echo "export PREVIOUS_HOSTNAME=${HOSTNAME}" > $WAS_STARTED_WITH_REPLICATION
+
     else
 
       log-helper info "Disable replication config..."
@@ -450,17 +508,17 @@ EOF
       get_ldap_base_dn
       LDAP_CONFIG_PASSWORD_ENCRYPTED=$(slappasswd -s "$LDAP_CONFIG_PASSWORD")
       LDAP_ADMIN_PASSWORD_ENCRYPTED=$(slappasswd -s "$LDAP_ADMIN_PASSWORD")
-      sed -i "s|{{ LDAP_CONFIG_PASSWORD_ENCRYPTED }}|${LDAP_CONFIG_PASSWORD_ENCRYPTED}|g" ${CONTAINER_SERVICE_DIR}/slapd/assets/config/admin-pw/ldif/06-root-pw-change.ldif
-      sed -i "s|{{ LDAP_ADMIN_PASSWORD_ENCRYPTED }}|${LDAP_ADMIN_PASSWORD_ENCRYPTED}|g" ${CONTAINER_SERVICE_DIR}/slapd/assets/config/admin-pw/ldif/06-root-pw-change.ldif
-      sed -i "s|{{ LDAP_BACKEND }}|${LDAP_BACKEND}|g" ${CONTAINER_SERVICE_DIR}/slapd/assets/config/admin-pw/ldif/06-root-pw-change.ldif
-      sed -i "s|{{ LDAP_ADMIN_PASSWORD_ENCRYPTED }}|${LDAP_ADMIN_PASSWORD_ENCRYPTED}|g" ${CONTAINER_SERVICE_DIR}/slapd/assets/config/admin-pw/ldif/07-admin-pw-change.ldif
-      sed -i "s|{{ LDAP_BASE_DN }}|${LDAP_BASE_DN}|g" ${CONTAINER_SERVICE_DIR}/slapd/assets/config/admin-pw/ldif/07-admin-pw-change.ldif
+      sed -i "s|{{ LDAP_CONFIG_PASSWORD_ENCRYPTED }}|${LDAP_CONFIG_PASSWORD_ENCRYPTED}|g" ${CONTAINER_SERVICE_DIR}/slapd/assets/config/admin/root-password-change.ldif
+      sed -i "s|{{ LDAP_ADMIN_PASSWORD_ENCRYPTED }}|${LDAP_ADMIN_PASSWORD_ENCRYPTED}|g" ${CONTAINER_SERVICE_DIR}/slapd/assets/config/admin/root-password-change.ldif
+      sed -i "s|{{ LDAP_BACKEND }}|${LDAP_BACKEND}|g" ${CONTAINER_SERVICE_DIR}/slapd/assets/config/admin/root-password-change.ldif
+      sed -i "s|{{ LDAP_ADMIN_PASSWORD_ENCRYPTED }}|${LDAP_ADMIN_PASSWORD_ENCRYPTED}|g" ${CONTAINER_SERVICE_DIR}/slapd/assets/config/admin/admin-password-change.ldif
+      sed -i "s|{{ LDAP_BASE_DN }}|${LDAP_BASE_DN}|g" ${CONTAINER_SERVICE_DIR}/slapd/assets/config/admin/admin-password-change.ldif
 
-      for f in $(find ${CONTAINER_SERVICE_DIR}/slapd/assets/config/admin-pw/ldif -type f -name \*.ldif  | sort); do
-        ldap_add_or_modify "$f"
-      done
+      ldap_add_or_modify "${CONTAINER_SERVICE_DIR}/slapd/assets/config/admin/root-password-change.ldif"
+      ldap_add_or_modify "${CONTAINER_SERVICE_DIR}/slapd/assets/config/admin/admin-password-change.ldif" | log-helper debug || true
+
     else
-       touch "$WAS_ADMIN_PASSWORD_SET"
+        touch "$WAS_ADMIN_PASSWORD_SET"
     fi
 
     #
@@ -507,8 +565,17 @@ ln -sf ${CONTAINER_SERVICE_DIR}/slapd/assets/.ldaprc $HOME/.ldaprc
 ln -sf ${CONTAINER_SERVICE_DIR}/slapd/assets/ldap.conf /etc/ldap/ldap.conf
 
 # force OpenLDAP to listen on all interfaces
+# We need to make sure that /etc/hosts continues to include the
+# fully-qualified domain name and not just the specified hostname.
+# Without the FQDN, /bin/hostname --fqdn stops working.
+FQDN="$(/bin/hostname --fqdn)"
+if [ "$FQDN" != "$HOSTNAME" ]; then
+    FQDN_PARAM="$FQDN"
+else
+    FQDN_PARAM=""
+fi
 ETC_HOSTS=$(cat /etc/hosts | sed "/$HOSTNAME/d")
-echo "0.0.0.0 $HOSTNAME" > /etc/hosts
+echo "0.0.0.0 $FQDN_PARAM $HOSTNAME" > /etc/hosts
 echo "$ETC_HOSTS" >> /etc/hosts
 
 exit 0
